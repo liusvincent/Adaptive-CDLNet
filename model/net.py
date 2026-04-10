@@ -276,9 +276,9 @@ class AdaCDLNet_SM(nn.Module):
     Convolutional Dictionary Learning Network with Ada-LISTA (Single Matrix)
 
     Update step:
-        z{k+1} = ST(z{k} - D^T W^T{k} (D z{k} - y), tau{k})
+        z{k+1} = ST(z{k} - D^T W^T{k} (mask * D z{k} - y), tau{k})
         or
-        z{k+1} = ST(z{k} + D^T W^T{k} (y - D z{k}), tau{k})
+        z{k+1} = ST(z{k} + D^T W^T{k} (y - mask * D z{k}), tau{k})
         
         Ada-LISTA — Single Matrix definition inspired from:
         Aberdam et al., "Ada-LISTA: Learned Solvers Adaptive to Varying Models",
@@ -287,12 +287,13 @@ class AdaCDLNet_SM(nn.Module):
 
     Where:
         D      ...convolutional synthesis dictionary
-        DT     ...convolutional analysis dictionary (derived from the same dictionary)
-        W^T{k}   ...learned image-domain operator at iteration k
+        DT     ...convolutional analysis dictionary
+        W^T{k} ...learned parameter at iteration k (weights)
         tau{k} ...learned threshold at iteration k
         y      ...input image
         z{k}   ...sparse code at iteration k
         z{0}   ...0
+        mask   ...image-domain masking operator (use mask = 1 for plain denoising)
     """
     def __init__(self,
                  K = 3,             # num. unrollings
@@ -432,18 +433,25 @@ class AdaCDLNet_Full(nn.Module):
     Convolutional Dictionary Learning Network with Ada-LISTA (Full Version)
 
     Update step:
-        z{k+1} = ST(z{k} - ( gamma{k} D^T W2^T{k} W2{k} D z{k} ) + ( gamma{k} * D^T W1^T{k} y ), tau{k})
+        z{k+1} = ST(z{k} - ( gamma{k} D^T W2^T{k} W2{k} mask * D z{k} ) + ( gamma{k} * D^T W1^T{k} y ), tau{k})
 
-        Ada-LISTA definition from:
+        Ada-LISTA definition inspired from:
         Aberdam et al., "Ada-LISTA: Learned Solvers Adaptive to Varying Models",
         arXiv:2001.08456 (2020).
         https://arxiv.org/abs/2001.08456
 
     Where:
-        D      ...convolutional synthesis dictionary, shape: [M, C, P, P]
-        DT     ...convolutional analysis dictionary
-        W{k}   ...learned parameter 
-        tau{k} ...learned threshold
+        D         ...convolutional synthesis dictionary
+        DT        ...convolutional analysis dictionary
+        W1{k}     ...learned parameter at iteration k (weights)
+        W2{k}     ...learned parameter at iteration k (weights)
+        tau{k}    ...learned threshold at iteration k
+        y         ...input image
+        z{k}      ...sparse code at iteration k
+        z{0}      ...0
+        gammas{k} ...learned step-size parameter at iteration k
+        mask      ...image-domain masking operator (use mask = 1 for plain denoising)
+
     """
     def __init__(self,
                  K = 3,             # num. unrollings
