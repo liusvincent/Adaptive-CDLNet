@@ -23,7 +23,7 @@ class CDLNet(nn.Module):
                  P = 7,            # square filter side length
                  s = 1,            # stride of convolutions
                  C = 1,            # num. input channels
-                 t0 = 0,        # initial threshold
+                 t0 = 0,           # initial threshold
                  adaptive = False, # noise-adaptive thresholds
                  init = True):     # False -> use power-method for weight init
         super(CDLNet, self).__init__()
@@ -279,9 +279,14 @@ class AdaCDLNet_SM(nn.Module):
         z{k+1} = ST(z{k} - D^T W{k}^T (D z{k} - y), tau{k})
         or
         z{k+1} = ST(z{k} + D^T W{k}^T (y - D z{k}), tau{k})
+        
+        Ada-LISTA — Single Matrix definition from:
+        Aberdam et al., "Ada-LISTA: Learned Solvers Adaptive to Varying Models",
+        arXiv:2001.08456 (2020).
+        https://arxiv.org/abs/2001.08456
 
     Where:
-        D      ...convolutional synthesis dictionary, shape: [M, C, P, P]
+        D      ...convolutional synthesis dictionary
         DT     ...convolutional analysis dictionary (derived from the same dictionary)
         W{k}   ...learned image-domain operator at iteration k
         tau{k} ...learned threshold at iteration k
@@ -304,20 +309,12 @@ class AdaCDLNet_SM(nn.Module):
         # -- OPERATOR INIT --
         self.W = nn.ModuleList([nn.Conv2d(C, C, P, stride=1, padding=(P-1)//2, bias=False)  for _ in range(K)])
         self.t = nn.Parameter(t0*torch.ones(K,2,M,1,1)) # learned thresholds
+        self.D = nn.Parameter(torch.randn(M, C, P, P)) # conv dictionary filters, define D and D^T operators
 
         # set weights 
         W_temp = torch.randn(C, C, P, P)
         for k in range(K):
             self.W[k].weight.data = W_temp.clone()
-
-        # Don't bother running code if initializing trained model from state-dict
-        if init:
-            with torch.no_grad():
-                center = P // 2
-                for k in range(K):
-                    self.W[k].weight.zero_()
-                    for c in range(C):
-                        self.W[k].weight[c, c, center, center] = 1.0
 
         # set parameters
         self.K = K
@@ -327,41 +324,64 @@ class AdaCDLNet_SM(nn.Module):
         self.t0 = t0
         self.adaptive = adaptive
 
+        # Don't bother running code if initializing trained model from state-dict
+        if init:
+            with torch.no_grad():
+                # initialize W{k} as identity convolutions
+                center = P // 2
+                for k in range(K):
+                    self.W[k].weight.zero_()
+                    for c in range(C):
+                        self.W[k].weight[c, c, center, center] = 1.0
+
+                print("Running power-method on initial dictionary...")
+                DDt = lambda x: self.synthesis(self.analysis(x))
+                L = power_method(DDt, torch.rand(1,C,128,128), num_iter=200, verbose=False)[0]
+                print(f"Done. L={L:.3e}.")
+
+                if L <= 0:
+                    print("STOP: something is very very wrong...")
+                    sys.exit()
+
+                # spectral normalization
+                self.D /= np.sqrt(L)
+
     @torch.no_grad()
     def project(self):
         """ 
-        \ell_2 ball projection for filters, R_+ projection for thresholds
+        \ell_2 ball projection for W and D + projection for thresholds
         """
         self.t.clamp_(0.0) 
         for k in range(self.K):
-            self.W[k].weight.data = uball_project(self.W[k].weight.data)
+            self.W[k].weight.copy_(uball_project(self.W[k].weight))
+        self.D.copy_(uball_project(self.D))
 
-    def synthesis(self, z, D_filters):
+    def synthesis(self, z):
         """
         x = D z
         """
         return F.conv_transpose2d(
             z,
-            D_filters,
+            self.D,
             stride = self.s,
             padding=(self.P-1)//2,
             output_padding=self.s - 1
         )
     
-    def analysis(self, x, D_filters):
+    def analysis(self, x):
         """
         z = D^T x
         """
         return F.conv2d(
             x, 
-            D_filters,
+            self.D,
             stride = self.s,
             padding=(self.P-1)//2
         )
 
-    def forward(self, y, D_filters, sigma=None, mask=1):
+    def forward(self, y, sigma=None, mask=1):
         """ 
-        AdaLISTA with D as input w/ noise-adaptive thresholds
+        AdaLISTA with learned internal dictionary and noise-adaptive thresholds
         """ 
         yp, params, mask = pre_process(y, self.s, mask=mask)
 
@@ -369,48 +389,48 @@ class AdaCDLNet_SM(nn.Module):
         c = 0 if sigma is None or not self.adaptive else sigma/255.0
 
         # Ada-LISTA
-        z = ST(self.analysis(self.W[0](yp), D_filters), self.t[0,:1] + c*self.t[0,1:2])
+        z = ST(self.analysis(self.W[0](yp)), self.t[0,:1] + c*self.t[0,1:2])
         for k in range(1, self.K):
-            z = ST(z - self.analysis(self.W[k](mask * self.synthesis(z, D_filters) - yp), D_filters), self.t[k,:1] + c*self.t[k,1:2])
+            z = ST(z - self.analysis(self.W[k](mask * self.synthesis(z) - yp)), self.t[k,:1] + c*self.t[k,1:2])
 
         # DICTIONARY SYNTHESIS
-        xphat = self.synthesis(z, D_filters)
+        xphat = self.synthesis(z)
         xhat  = post_process(xphat, params)
         return xhat, z
 
-    def forward_generator(self, y, D_filters, sigma=None, mask=1):
+    def forward_generator(self, y, sigma=None, mask=1):
         """ 
         same as forward but yields reconstructed image
         """
         yp, params, mask = pre_process(y, self.s, mask=mask)
         c = 0 if sigma is None or not self.adaptive else sigma/255.0
-        z = ST(self.analysis(self.W[0](yp), D_filters), self.t[0,:1] + c*self.t[0,1:2])
+        z = ST(self.analysis(self.W[0](yp)), self.t[0,:1] + c*self.t[0,1:2])
         for k in range(1, self.K):
-            z = ST(z - self.analysis(self.W[k](mask * self.synthesis(z, D_filters) - yp), D_filters), self.t[k,:1] + c*self.t[k,1:2])
-        xphat = self.synthesis(z, D_filters)
+            z = ST(z - self.analysis(self.W[k](mask * self.synthesis(z) - yp)), self.t[k,:1] + c*self.t[k,1:2])
+        xphat = self.synthesis(z)
         xhat  = post_process(xphat, params)
         yield xhat
 
-    def forward_generator_sparse(self, y, D_filters, sigma=None, mask=1):
+    def forward_generator_sparse(self, y, sigma=None, mask=1):
         """ 
         same as forward but yields intermediate sparse codes and reconstructed image
         """
         yp, params, mask = pre_process(y, self.s, mask=mask)
         c = 0 if sigma is None or not self.adaptive else sigma/255.0
-        z = ST(self.analysis(self.W[0](yp), D_filters), self.t[0,:1] + c*self.t[0,1:2])
+        z = torch.zeros_like(self.analysis(yp))
         yield {"type": "sparsecode", "k": 0, "z": z}
 
-        for k in range(1, self.K):
-            z = ST(z - self.analysis(self.W[k](mask * self.synthesis(z, D_filters) - yp), D_filters), self.t[k,:1] + c*self.t[k,1:2])
-            yield {"type": "sparsecode", "k": k, "z": z}
+        for k in range(self.K):
+            z = ST(z - self.analysis(self.W[k](mask * self.synthesis(z) - yp)), self.t[k,:1] + c*self.t[k,1:2])
+            yield {"type": "sparsecode", "k": k+1, "z": z}
 
-        xphat = self.synthesis(z, D_filters)
+        xphat = self.synthesis(z)
         xhat  = post_process(xphat, params)
         yield {"type": "reconimage", "xhat": xhat}
     
 class AdaCDLNet_Full(nn.module):
     """ 
-        Convolutional Dictionary Learning Network with Ada-LISTA (Single Matrix)
+        Convolutional Dictionary Learning Network with Ada-LISTA
 
         Update step:
         z{k+1} = ST(z{k} - D^T W{k}^T (D z{k}) - y, tau{k})
