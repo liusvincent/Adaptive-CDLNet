@@ -276,16 +276,18 @@ class AdaCDLNet_SM(nn.Module):
     Convolutional Dictionary Learning Network with Ada-LISTA (Single Matrix)
 
     Update step:
-        z{k+1} = ST(z{k} - D^T W{k}^T (D z{k}) - y, tau{k})
+        z{k+1} = ST(z{k} - D^T W{k}^T (D z{k} - y), tau{k})
+        or
+        z{k+1} = ST(z{k} + D^T W{k}^T (y - D z{k}), tau{k})
 
     Where:
         D      ...convolutional synthesis dictionary, shape: [M, C, P, P]
-        DT     ...convolutional analysis dictionary
-        W{k}   ...learned parameter 
-        tau{k} ...learned threshold
-        y      ...original image
-        z{k}   ...sparse coding
-
+        DT     ...convolutional analysis dictionary (derived from the same dictionary)
+        W{k}   ...learned image-domain operator at iteration k
+        tau{k} ...learned threshold at iteration k
+        y      ...input image
+        z{k}   ...sparse code at iteration k
+        z{0}   ...0
     """
     def __init__(self,
                  K = 3,             # num. unrollings
@@ -295,12 +297,12 @@ class AdaCDLNet_SM(nn.Module):
                  C = 1,             # num. input channels
                  t0 = 0,            # initial threshold
                  adaptive = False,  # noise-adaptive thresholds
-                 init = True,       # False -> use power-method for weight init
-                 D = None):         # dictionary input
+                 init = True):      # False -> use power-method for weight init
+
         super(AdaCDLNet_SM, self).__init__()
         
         # -- OPERATOR INIT --
-        self.W = nn.ModuleList([nn.Conv2d(C, C, P, stride=s, padding=(P-1)//2, bias=False)  for _ in range(K)])
+        self.W = nn.ModuleList([nn.Conv2d(C, C, P, stride=1, padding=(P-1)//2, bias=False)  for _ in range(K)])
         self.t = nn.Parameter(t0*torch.ones(K,2,M,1,1)) # learned thresholds
 
         # set weights 
