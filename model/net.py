@@ -67,7 +67,7 @@ class CDLNet(nn.Module):
 
     @torch.no_grad()
     def project(self):
-        """ \ell_2 ball projection for filters, R_+ projection for thresholds
+        r""" \ell_2 ball projection for filters, R_+ projection for thresholds
         """
         self.t.clamp_(0.0) 
         for k in range(self.K):
@@ -190,7 +190,7 @@ class GDLNet(nn.Module):
 
     @torch.no_grad()
     def project(self):
-        """ \ell_2 ball projection for filters, R_+ projection for thresholds
+        r""" \ell_2 ball projection for filters, R_+ projection for thresholds
         """
         self.t.clamp_(0.0) 
 
@@ -348,7 +348,7 @@ class AdaCDLNet_SM(nn.Module):
 
     @torch.no_grad()
     def project(self):
-        """ 
+        r""" 
         \ell_2 ball projection for W and D + projection for thresholds
         """
         self.t.clamp_(0.0) 
@@ -381,7 +381,7 @@ class AdaCDLNet_SM(nn.Module):
 
     def forward(self, y, sigma=None, mask=1):
         """ 
-        AdaLISTA with learned internal dictionary and noise-adaptive thresholds
+        AdaLISTA w/noise-adaptive thresholds
         """ 
         yp, params, mask = pre_process(y, self.s, mask=mask)
 
@@ -511,7 +511,7 @@ class AdaCDLNet_Full(nn.Module):
 
     @torch.no_grad()
     def project(self):
-        """ 
+        r""" 
         \ell_2 ball projection for W and D + projection for thresholds and gamma
         """
         self.t.clamp_(0.0) 
@@ -558,7 +558,7 @@ class AdaCDLNet_Full(nn.Module):
 
     def forward(self, y, sigma=None, mask=1):
         """ 
-        AdaLISTA with learned internal dictionary and noise-adaptive thresholds
+        AdaLISTA w/noise-adaptive thresholds
         """ 
         yp, params, mask = pre_process(y, self.s, mask=mask)
 
@@ -568,7 +568,7 @@ class AdaCDLNet_Full(nn.Module):
         # Ada-LISTA
         z = torch.zeros_like(self.analysis(yp))
         for k in range(self.K):
-            A = self.gammas[k] * self.analysis(self.W2T[k](self.W2[k](mask * self.synthesis(z), k)))
+            A = self.gammas[k] * self.analysis(self.W2T(self.W2[k](mask * self.synthesis(z)), k))
             B = self.gammas[k] * self.analysis(self.W1[k](yp))
             z = ST(z - A + B, self.t[k,:1] + c*self.t[k,1:2])
 
@@ -585,7 +585,7 @@ class AdaCDLNet_Full(nn.Module):
         c = 0 if sigma is None or not self.adaptive else sigma/255.0
         z = torch.zeros_like(self.analysis(yp))
         for k in range(self.K):
-            A = self.gammas[k] * self.analysis(self.W2T[k](self.W2[k](mask * self.synthesis(z), k)))
+            A = self.gammas[k] * self.analysis(self.W2T(self.W2[k](mask * self.synthesis(z)), k))
             B = self.gammas[k] * self.analysis(self.W1[k](yp))
             z = ST(z - A + B, self.t[k,:1] + c*self.t[k,1:2])
         xphat = self.synthesis(z)
@@ -602,7 +602,7 @@ class AdaCDLNet_Full(nn.Module):
         yield {"type": "sparsecode", "k": 0, "z": z}
 
         for k in range(self.K):
-            A = self.gammas[k] * self.analysis(self.W2T[k](self.W2[k](mask * self.synthesis(z), k)))
+            A = self.gammas[k] * self.analysis(self.W2T(self.W2[k](mask * self.synthesis(z)), k))
             B = self.gammas[k] * self.analysis(self.W1[k](yp))
             z = ST(z - A + B, self.t[k,:1] + c*self.t[k,1:2])
             yield {"type": "sparsecode", "k": k+1, "z": z}

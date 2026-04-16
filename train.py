@@ -5,7 +5,7 @@ from pprint import pprint
 import numpy as np
 import torch
 import torch.nn as nn
-from model.net import CDLNet, GDLNet, DnCNN, FFDNet
+from model.net import CDLNet, GDLNet, DnCNN, FFDNet, AdaCDLNet_Full, AdaCDLNet_SM
 from data import get_fit_loaders
 from utils import awgn, gen_bayer_mask
 
@@ -196,6 +196,10 @@ def init_model(args, device=torch.device("cpu")):
         net = DnCNN(**model_args)
     elif model_type == "FFDNet":
         net = FFDNet(**model_args)
+    elif model_type == "AdaCDLNet_SM":
+        net = AdaCDLNet_SM(**model_args)
+    elif model_type == "AdaCDLNet_Full":
+        net = AdaCDLNet_Full(**model_args)
     else:
         raise NotImplementedError
 
