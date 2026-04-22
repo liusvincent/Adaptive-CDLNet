@@ -76,3 +76,8 @@ def visplot(images,
 			if (titles is not None) and (ind < len(titles)):
 				axs[ii,jj].set_title(titles[ind])
 	return fig
+
+def check_gpu() -> torch.device:
+	if torch.cuda.is_available(): return torch.device("cuda")
+	elif torch.backends.mps.is_available(): return torch.device("mps")
+	else: return torch.device("cpu")

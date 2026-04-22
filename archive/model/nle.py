@@ -3,8 +3,8 @@ import torch.nn.functional as F
 import numpy as np
 import scipy 
 from scipy.stats import gamma
-import model.wvlt as wvlt
-import model.utils as utils
+import archive.model.wvlt as wvlt
+import archive.model.utils as utils
 
 def noise_level(y, method="MAD", **kwargs):
     if method in [True, "MAD", "wvlt"]:

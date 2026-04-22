@@ -10,9 +10,9 @@ from torchvision.utils import save_image, make_grid
 import matplotlib.pyplot as plt
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 
-import model
-import model.nle
-import utils, data, train
+import archive.model as model
+import archive.model.nle
+import archive.utils as utils, archive.data as data, archive.train as train
 
 import argparse
 parser = argparse.ArgumentParser()
@@ -30,45 +30,6 @@ parser.add_argument("--color", action="store_true", help="Use color images.")
 parser.add_argument("--demosaic", action="store_true", help="Demosaicing problem.")
 
 ARGS = parser.parse_args()
-
-def main(model_args):
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-    elif torch.backends.mps.is_available():
-        device = torch.device("mps")
-    else:
-        device = torch.device("cpu")
-
-    print(f"Using device {device}.")
-    net, _, _, epoch0 = train.init_model(model_args, device=device)
-    net.eval()
-    # ---------------------------------------------------
-    # ---------------------------------------------------
-
-    if ARGS.save_dir is None:
-        ARGS.save_dir = model_args['paths']['save']
-
-    if len(ARGS.noise_level) == 1:
-        ARGS.noise_level = ARGS.noise_level[0]
-    if ARGS.noise_level == -1:
-        ARGS.noise_level = model_args['train']['fit']['noise_std']
-
-    with torch.no_grad():
-        if ARGS.test is not None:
-            loader = data.get_data_loader([ARGS.test], load_color=ARGS.color, test=True)
-            test(net, loader, noise_level=ARGS.noise_level, blind=ARGS.blind, device=device)
-
-        if ARGS.dictionary:
-            dictionary(net)
-
-        if ARGS.passthrough is not None:
-            passthrough(net, ARGS.passthrough, ARGS.noise_level, blind=ARGS.blind, demosaic=ARGS.demosaic, device=device, color=ARGS.color)
-
-        if ARGS.thresholds:
-            thresholds(net, noise_level=ARGS.noise_level)
-
-        if ARGS.filters:
-            filters(net, scale_each=True)
 
 def test(net, loader, noise_level=25, blind=False, device=torch.device('cpu')):
     """ Evaluate net on test-set.
@@ -91,7 +52,7 @@ def test(net, loader, noise_level=25, blind=False, device=torch.device('cpu')):
             y = mask*y
             if net.adaptive:
                 if blind is not None and blind is not False:
-                    s = 255 * model.nle.noise_level(y, method=blind)
+                    s = 255 * archive.model.nle.noise_level(y, method=blind)
                     print(f"sigma_hat = {sigma.flatten().item():.3f}")
                 else:
                     print(f"using GT sigma.")
@@ -229,7 +190,7 @@ def passthrough(net, img_path, noise_std, device=torch.device('cpu'), blind=Fals
     print(f"noise_std = {sigma}")
     if net.adaptive:
         if blind is not None and blind is not False:
-            sigma = 255 * model.nle.noise_level(y, method=blind)
+            sigma = 255 * archive.model.nle.noise_level(y, method=blind)
             print(f"sigma_hat = {sigma.flatten().item():.3f}")
         else:
             print(f"using GT sigma.")
@@ -258,6 +219,40 @@ def passthrough(net, img_path, noise_std, device=torch.device('cpu'), blind=Fals
     print(f"Saving y, xhat, x at {fn} ...")
     save_image(torch.cat([y, xhat, x]), fn, nrow=3, scale_each=False, normalize=False)
     print("done.")
+
+def main(model_args):
+    device = utils.check_gpu()
+    print(f"Using device {device}.")
+    
+    net, _, _, epoch0 = train.init_model(model_args, device=device)
+    net.eval()
+    # ---------------------------------------------------
+    # ---------------------------------------------------
+
+    if ARGS.save_dir is None:
+        ARGS.save_dir = model_args['paths']['save']
+
+    if len(ARGS.noise_level) == 1:
+        ARGS.noise_level = ARGS.noise_level[0]
+    if ARGS.noise_level == -1:
+        ARGS.noise_level = model_args['train']['fit']['noise_std']
+
+    with torch.no_grad():
+        if ARGS.test is not None:
+            loader = data.get_data_loader([ARGS.test], load_color=ARGS.color, test=True)
+            test(net, loader, noise_level=ARGS.noise_level, blind=ARGS.blind, device=device)
+
+        if ARGS.dictionary:
+            dictionary(net)
+
+        if ARGS.passthrough is not None:
+            passthrough(net, ARGS.passthrough, ARGS.noise_level, blind=ARGS.blind, demosaic=ARGS.demosaic, device=device, color=ARGS.color)
+
+        if ARGS.thresholds:
+            thresholds(net, noise_level=ARGS.noise_level)
+
+        if ARGS.filters:
+            filters(net, scale_each=True)
 
 if __name__ == "__main__":
     """ Load arguments from json file and command line and pass to main.

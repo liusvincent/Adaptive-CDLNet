@@ -1,4 +1,4 @@
-from model.net import AdaCDLNet_SM, AdaCDLNet_Full
+from archive.model.net import AdaCDLNet_SM, AdaCDLNet_Full
 import torch
 
 x = torch.randn(1, 1, 128, 128)
