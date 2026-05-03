@@ -57,7 +57,8 @@ def conv_pad(x, ks, mode):
     return F.pad(x, (*pad, *pad), mode=mode)
 
 def unpad(I, pad):
-    """ Remove padding from 2D signalstack"""
+    """ Remove padding from 2D signalstack
+    """
     if pad[3] == 0 and pad[1] > 0:
         return I[..., pad[2]:, pad[0]:-pad[1]]
     elif pad[3] > 0 and pad[1] == 0:

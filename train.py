@@ -4,119 +4,11 @@ from pprint import pprint
 import numpy as np
 import torch
 import torch.nn as nn
-from archive.model.net import CDLNet, GDLNet, DnCNN, FFDNet, AdaCDLNet_Full, AdaCDLNet_SM
-from archive.data import get_fit_loaders
-from archive.utils import awgn, gen_bayer_mask
 
-class Trainer:
-    """
-    Class to handle training (Training Engine)
-    """
-    def __init__(self, net, opt, loaders,
-        sched = None,
-        epochs = 1,
-        device = torch.device("cpu"),
-        save_dir = None,
-        start_epoch = 1,
-        clip_grad = 1,
-        noise_std = 25,
-        demosaic = False,
-        verbose = True,
-        val_freq  = 1,
-        save_freq = 1,
-        epoch_fun = None,
-        mcsure = False,
-        backtrack_thresh = 1,
-        mode = "offline"):
-        self.net = net
-        self.opt = opt
-        self.loaders = loaders
-        self.sched = sched
-        self.epochs = epochs
-        self.device = device
-        self.save_dir = save_dir
-        self.start_epoch = start_epoch
-        self.epoch = start_epoch
-        self.clip_grad = clip_grad
-        self.noise_std = noise_std if isinstance(noise_std, (list, tuple)) else (noise_std, noise_std)
-        self.demosaic = demosaic
-        self.verbose = verbose
-        self.val_freq = val_freq
-        self.save_freq = save_freq
-        self.epoch_fun = epoch_fun
-        self.mcsure = mcsure
-        self.backtrack_thresh = backtrack_thresh
-        self.mode = mode
-
-        self.top_psnr = {"train": 0, "val": 0, "test": 0}
-        self.last_loss = None
-        self.last_psnr = None
-        self.diverged = False
-    
-    def fit(self):
-        """
-        full training loop
-        """
-        print(f"fit: using device {self.device}")
-
-        if not type(self.noise_std) in [list, tuple]:
-            self.noise_std = (self.noise_std, self.noise_std)
-
-        print("Saving initialization to 0.ckpt")
-
-        ckpt_path = os.path.join(self.save_dir, '0.ckpt')
-        save_ckpt(ckpt_path, self.net, 0, self.opt, self.sched)
-
-        top_psnr = {"train": 0, "val": 0, "test": 0} # for backtracking
-        epoch = self.start_epoch
-
-        while epoch < self.start_epoch + self.epochs:
-            for phase in ['train', 'val', 'test']:
-                self.net.train() if phase == 'train' else self.net.eval()
-                if epoch != self.epochs and phase == 'test':
-                    continue
-                if phase == 'val' and epoch % self.val_freq != 0:
-                    continue
-                if phase in ['val', 'test']:
-                    phase_nstd = (self.noise_std[0]+self.noise_std[1])/2.0
-                else:
-                    phase_nstd = self.noise_std
-                psnr = 0
-
-                t = tqdm(iter(self.loaders[phase]), desc=phase.upper()+'-E'+str(epoch), dynamic_ncols=True)
-                for itern, batch in enumerate(t):
-                    batch = batch.to(self.device)
-                    mask = gen_bayer_mask(batch) if self.demosaic else 1
-                    noisy_batch, sigma_n = awgn(batch, phase_nstd)
-                    obsrv_batch = mask * noisy_batch
-                    self.opt.zero_grad()
-
-    def batch(self):
-        ...
-    
-    def online(self):
-        ...
-
-    def online_fit():
-        ...
-
-    def val_phase():
-        ...
-
-    def test_phase():
-        ...
-
-def main(args):
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-    elif torch.backends.mps.is_available():
-        device = torch.device("mps")
-    else:
-        device = torch.device("cpu")
-
-    model_args, train_args, paths, mode = [args[item] for item in ['model','train','paths','mode']]
-    loaders = get_fit_loaders(**train_args['loaders'])
-    net, opt, sched, epoch0 = init_model(args, device=device)
+import model
+from .model import *
+from .data import get_fit_loaders
+from .utils import awgn, gen_bayer_mask, check_gpu
 
 def fit(net, opt, loaders,
         sched = None,
@@ -132,17 +24,11 @@ def fit(net, opt, loaders,
         save_freq = 1,
         epoch_fun = None,
         mcsure = False,
-        backtrack_thresh = 1,
-        mode = "offline"):
-    """ 
-    Train a model for several epochs.
-    Also runs validation and test, saves checkpoints,
-    and can roll back if performance gets much worse.
+        backtrack_thresh = 1):
+    """ fit net to training data.
     """
-
     print(f"fit: using device {device}")
 
-    # Always format noise_std as a tuple
     if not type(noise_std) in [list, tuple]:
         noise_std = (noise_std, noise_std)
 
@@ -157,27 +43,15 @@ def fit(net, opt, loaders,
     while epoch < start_epoch + epochs:
         for phase in ['train', 'val', 'test']:
             net.train() if phase == 'train' else net.eval()
-            # skip test if not last epoch
             if epoch != epochs and phase == 'test':
                 continue
-            # skip validation if epoch is not a multiple val_freq
             if phase == 'val' and epoch%val_freq != 0:
                 continue
-
             if phase in ['val', 'test']:
                 phase_nstd = (noise_std[0]+noise_std[1])/2.0
             else:
                 phase_nstd = noise_std
-
             psnr = 0
-
-            if mode == "offline":
-                batch_fit(...)
-            elif mode == "online":
-                online_fit(...)
-            else:
-                raise NotImplementedError
-
 
             t = tqdm(iter(loaders[phase]), desc=phase.upper()+'-E'+str(epoch), dynamic_ncols=True)
             for itern, batch in enumerate(t):
@@ -264,12 +138,8 @@ def fit(net, opt, loaders,
 
         epoch = epoch + 1
 
-def batch_fit():
-    
-
-def online_fit():
-    """Online learning"""
-    print(f"fit: using device {device}")
+def fit_single(device, stream):
+     print(f"fit: using device {device}")
 
     if not type(noise_std) in [list, tuple]:
         noise_std = (noise_std, noise_std)
@@ -280,21 +150,10 @@ def online_fit():
     save_ckpt(ckpt_path, net, 0, opt, sched)
 
     top_psnr = {"train": 0, "val": 0, "test": 0} # for backtracking
-    epoch = start_epoch
 
-    while epoch < start_epoch + epochs:
-        for phase in ['train', 'val', 'test']:
-            net.train()
-            net.train() if phase == 'train' else net.eval()
-            if epoch != epochs and phase == 'test':
-                continue
-            if phase == 'val' and epoch%val_freq != 0:
-                continue
-            if phase in ['val', 'test']:
-                phase_nstd = (noise_std[0]+noise_std[1])/2.0
-            else:
-                phase_nstd = noise_std
-            psnr = 0
+    for i in stream:
+        
+
 def grad_norm(params):
     """ computes norm of mini-batch gradient
     """
@@ -316,6 +175,9 @@ def setlr(opt, lr):
         pg['lr'] = lr[i]
 
 def init_model(args, device=torch.device("cpu")):
+    """ Return model, optimizer, scheduler with optional initialization
+    from checkpoint.
+    """
     model_type, model_args, train_args, paths = [args[item] for item in ['type','model','train','paths']]
     init = False if paths['ckpt'] is not None else True
 
@@ -395,6 +257,25 @@ def save_args(args, ckpt=True):
         args['paths']['ckpt'] = ckpt_path
     with open(os.path.join(save_path, "args.json"), "+w") as outfile:
         outfile.write(json.dumps(args, indent=4, sort_keys=True))
+
+def main(args):
+    """ Given argument dictionary, load data, initialize model, and fit model.
+    """
+    device = check_gpu()
+
+    model_args, train_args, paths = [args[item] for item in ['model','train','paths']]
+    loaders = get_fit_loaders(**train_args['loaders'])
+    net, opt, sched, epoch0 = init_model(args, device=device)
+
+    fit(net, 
+        opt, 
+        loaders,
+        sched       = sched,
+        save_dir    = paths['save'],
+        start_epoch = epoch0 + 1,
+        device      = device,
+        **train_args['fit'],
+        epoch_fun = lambda epoch_num: save_args(args, epoch_num))
 
 if __name__ == "__main__":
     """ Load arguments dictionary from json file to pass to main.
