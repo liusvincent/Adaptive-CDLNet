@@ -23,7 +23,7 @@ class AdaCDLNet_SM(nn.Module):
     Where:
         D      ...convolutional synthesis dictionary
         DT     ...convolutional analysis dictionary
-        W^T{k} ...learned parameter at iteration k (weights)
+        W{k}   ...learned parameter at iteration k (weights)
         tau{k} ...learned threshold at iteration k
         y      ...input image
         z{k}   ...sparse code at iteration k
@@ -349,7 +349,7 @@ class AdaCDLNet_Full(nn.Module):
             z = ST(z - A + B, self.t[k,:1] + c*self.t[k,1:2])
         xphat = self.synthesis(z, D)
         xhat  = post_process(xphat, params)
-        return xhat, z
+        yield xhat
 
     def forward_generator_sparse(self, y, sigma=None, mask=1, D=None):
         """ same as forward but yields intermediate sparse codes and reconstructed image"""

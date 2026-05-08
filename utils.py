@@ -2,7 +2,7 @@ import torch
 from PIL import Image
 from matplotlib import pyplot as plt
 from torchvision.transforms.functional import to_tensor
-from .model.solvers import uball_project
+from model.solvers import uball_project
 
 def img_load(path, gray=False):
 	""" Load batched tensor image (1,C,H,W) from file path.

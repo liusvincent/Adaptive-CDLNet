@@ -10,10 +10,10 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 
 import model
-from .model import *
-from . import utils as utils
-from . import data as data
-from . import train as train
+from model import *
+import utils as utils
+import data as data
+import train as train
 
 import argparse
 
@@ -101,9 +101,9 @@ def filters(net, scale_each=False):
     save_dir = os.path.join(ARGS.save_dir, "filters")
     os.makedirs(save_dir, exist_ok=True)
 
-    if type(net) == model.net.GDLNet:
+    if type(net) == GDLNet:
         get_filter = lambda C: C.get_filter()
-    elif type(net) == model.net.CDLNet:
+    elif type(net) == CDLNet:
         get_filter = lambda C: C.weight.data
     else:
         raise NotImplementedError
@@ -153,10 +153,10 @@ def dictionary(net):
     """ Saves net dictionary's filters, frequency-response.
     """
     print("--------- dictionary ---------")
-    if type(net) is model.net.CDLNet:
+    if type(net) is CDLNet:
         #D = net.D.weight.cpu().permute(1,0,2,3)
         D = net.D.weight.cpu()
-    elif type(net) is model.net.GDLNet:
+    elif type(net) is GDLNet:
         D = net.D.get_filter().cpu()
     else:
         raise NotImplementedError

@@ -5,10 +5,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-import model
-from .model import *
-from .data import get_fit_loaders
-from .utils import awgn, gen_bayer_mask, check_gpu
+from model import *
+from data import get_fit_loaders
+from utils import awgn, gen_bayer_mask, check_gpu
 
 def fit(net, opt, loaders,
         sched = None,
@@ -138,21 +137,76 @@ def fit(net, opt, loaders,
 
         epoch = epoch + 1
 
-def fit_single(device, stream):
-     print(f"fit: using device {device}")
+def online_fit(net, opt, stream,
+               device=torch.device("cpu"),
+               save_dir=None,
+               clip_grad=1,
+               noise_std=25,
+               demosaic=False,
+               verbose=True,
+               mcsure=False,
+               save_freq=100):
+    """ Online fit: update dictionary only over a data stream.
+    """
+    print(f"online fit: using device {device}")
 
     if not type(noise_std) in [list, tuple]:
         noise_std = (noise_std, noise_std)
 
     print("Saving initialization to 0.ckpt")
+    if save_dir is not None:
+        ckpt_path = os.path.join(save_dir, "0.ckpt")
+        save_ckpt(ckpt_path, net, 0, opt, None)
 
-    ckpt_path = os.path.join(save_dir, '0.ckpt')
-    save_ckpt(ckpt_path, net, 0, opt, sched)
+    net.train()
 
-    top_psnr = {"train": 0, "val": 0, "test": 0} # for backtracking
+    psnr_total = 0.0
+    n_batches = 0
 
-    for i in stream:
-        
+    t = tqdm(stream, desc="ONLINE", dynamic_ncols=True)
+    for itern, batch in enumerate(t, start=1):
+        batch = batch.to(device)
+        phase_nstd = noise_std
+        mask = gen_bayer_mask(batch) if demosaic else 1
+        noisy_batch, sigma_n = awgn(batch, phase_nstd)
+        obsrv_batch = mask * noisy_batch
+
+        opt.zero_grad()
+        batch_hat, _ = net(obsrv_batch, sigma_n, mask=mask)
+
+        # supervised or unsupervised (MCSURE) loss during training
+        if mcsure:
+            h = 1e-3
+            b = torch.randn_like(obsrv_batch)
+            batch_hat_b, _ = net(obsrv_batch.clone() + h*b, sigma_n, mask=mask)
+            # assume you have a good estimator for sigma_n
+            div = 2.0*torch.mean(((sigma_n/255.0)**2)*b*(batch_hat_b-batch_hat)) / h
+            loss = torch.mean((obsrv_batch - batch_hat)**2) + div
+        else:
+            loss = torch.mean((batch - batch_hat)**2)
+        loss.backward()
+
+        if clip_grad is not None:
+            nn.utils.clip_grad_norm_(net.parameters(), clip_grad)
+
+        opt.step()
+        net.project()
+        loss_value = loss.item()
+        batch_psnr = -10 * np.log10(loss_value)
+        psnr_total += batch_psnr
+        n_batches += 1
+        avg_psnr = psnr_total / n_batches
+
+        if verbose:
+            total_norm = grad_norm(net.parameters())
+            t.set_postfix_str(f"loss={loss_value:.1e}|psnr={batch_psnr:.2f}|avg={avg_psnr:.2f}|gnorm={total_norm:.1e}")
+
+        if save_dir is not None and itern % save_freq == 0:
+            ckpt_path = os.path.join(save_dir, "online_net.ckpt")
+            save_ckpt(ckpt_path, net, itern, opt, None)
+
+    print(f"ONLINE AVG PSNR: {avg_psnr:.3f} dB")
+    return avg_psnr
 
 def grad_norm(params):
     """ computes norm of mini-batch gradient
@@ -267,6 +321,7 @@ def main(args):
     loaders = get_fit_loaders(**train_args['loaders'])
     net, opt, sched, epoch0 = init_model(args, device=device)
 
+    #offline
     fit(net, 
         opt, 
         loaders,
@@ -276,6 +331,12 @@ def main(args):
         device      = device,
         **train_args['fit'],
         epoch_fun = lambda epoch_num: save_args(args, epoch_num))
+    
+    # online
+    for p in net.parameters():
+        p.requires_grad_(False)
+    net.D.requires_grad_(True)
+    opt = torch.optim.Adam([net.D], lr=1e-4)
 
 if __name__ == "__main__":
     """ Load arguments dictionary from json file to pass to main.
