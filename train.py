@@ -37,6 +37,13 @@ def fit(net, opt, loaders,
     save_ckpt(ckpt_path, net, 0, opt, sched)
 
     top_psnr = {"train": 0, "val": 0, "test": 0} # for backtracking
+
+    # for early stopping
+    best_val_psnr = -float("inf")
+    patience = 500
+    min_delta = 0.01
+    bad_epochs = 0
+
     epoch = start_epoch
 
     while epoch < start_epoch + epochs:
@@ -98,6 +105,25 @@ def fit(net, opt, loaders,
 
             with open(os.path.join(save_dir, f'{phase}.txt'),'a') as psnr_file:
                 psnr_file.write(f'{psnr:.3f}, ')
+
+            # Early stopping based on validation PSNR
+            if phase == "val":
+                if psnr > best_val_psnr + min_delta:
+                    best_val_psnr = psnr
+                    bad_epochs = 0
+
+                    # Save best validation checkpoint
+                    best_ckpt_path = os.path.join(save_dir, 'best_val.ckpt')
+                    print(f"New best validation PSNR: {psnr:.3f} dB")
+                    save_ckpt(best_ckpt_path, net, epoch, opt, sched)
+
+                else:
+                    bad_epochs += val_freq
+                    print(f"No validation improvement for {bad_epochs} epochs")
+
+                if bad_epochs >= patience:
+                    print("Early stopping triggered.")
+                    return
 
         if (psnr + backtrack_thresh < top_psnr[phase]) or np.isnan(loss) or np.isinf(loss):
             ckpt_path = os.path.join(save_dir, 'net.ckpt')
@@ -321,7 +347,7 @@ def main(args):
     loaders = get_fit_loaders(**train_args['loaders'])
     net, opt, sched, epoch0 = init_model(args, device=device)
 
-    #offline
+    # offline pretraining
     fit(net, 
         opt, 
         loaders,
@@ -332,11 +358,11 @@ def main(args):
         **train_args['fit'],
         epoch_fun = lambda epoch_num: save_args(args, epoch_num))
     
-    # online
+    # online preparation
     for p in net.parameters():
         p.requires_grad_(False)
     net.D.requires_grad_(True)
-    opt = torch.optim.Adam([net.D], lr=1e-4)
+    opt = torch.optim.Adam([net.D], **train_args['opt'])
 
 if __name__ == "__main__":
     """ Load arguments dictionary from json file to pass to main.
