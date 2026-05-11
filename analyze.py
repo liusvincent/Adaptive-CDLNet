@@ -153,15 +153,16 @@ def dictionary(net):
     """ Saves net dictionary's filters, frequency-response.
     """
     print("--------- dictionary ---------")
-    if type(net) is CDLNet:
-        #D = net.D.weight.cpu().permute(1,0,2,3)
-        D = net.D.weight.cpu()
-    elif type(net) is GDLNet:
-        D = net.D.get_filter().cpu()
+    if isinstance(net, CDLNet):
+        D = net.D.weight.detach().cpu()
+    elif isinstance(net, (AdaCDLNet_Full, AdaCDLNet_SM)):
+        D = net.D.detach().cpu()
+    elif isinstance(net, GDLNet):
+        D = net.D.get_filter().detach().cpu()
     else:
-        raise NotImplementedError
+        raise NotImplementedError(f"Unsupported net type: {type(net)}")
 
-    n = int(np.ceil(np.sqrt(net.M)))
+    n = int(np.ceil(np.sqrt(D.shape[0])))
 
     fn = os.path.join(ARGS.save_dir, "D_learned.png")
     print(f"Saving learned dictionary to {fn} ...")
@@ -169,7 +170,7 @@ def dictionary(net):
     save_image(D, fn, nrow=n, padding=2, scale_each=True, normalize=True)
 
     # plot frequency response of effective dictionary
-    X = torch.tensor(fftshift(fft2(D.detach().numpy(), (64,64)), axes=(-2,-1)))
+    X = torch.tensor(fftshift(fft2(D.numpy(), (64,64)), axes=(-2,-1)))
 
     fn = os.path.join(ARGS.save_dir, "freq.png")
     print(f"Saving dictionary magnitude response to {fn} ...")
