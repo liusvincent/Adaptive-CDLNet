@@ -23,7 +23,8 @@ def fit(net, opt, loaders,
         save_freq = 1,
         epoch_fun = None,
         mcsure = False,
-        backtrack_thresh = 1):
+        backtrack_thresh = 1,
+        dict_perturb_mode = None):
     """ fit net to training data.
     """
     print(f"fit: using device {device}")
