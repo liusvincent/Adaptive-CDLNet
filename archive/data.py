@@ -73,4 +73,3 @@ def get_fit_loaders(trn_path_list =['CBSD432'],
                                           load_color, 
                                           test=True)}
 	return dataloaders
-

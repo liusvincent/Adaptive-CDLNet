@@ -8,8 +8,8 @@
         "s": 1
     },
     "paths": {
-        "ckpt": "trained_nets/AdaCDLNet_Full/net.ckpt",
-        "save": "trained_nets/AdaCDLNet_Full"
+        "ckpt": "trained_nets/test_ada/net.ckpt",
+        "save": "trained_nets/test_ada"
     },
     "train": {
         "fit": {

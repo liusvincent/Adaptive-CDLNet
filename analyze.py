@@ -43,6 +43,10 @@ def test(net, loader, noise_level=25, blind=False, device=torch.device('cpu')):
     if not type(noise_level) in [range, list, tuple]:
         noise_level = [noise_level]
 
+    D_test = None
+    if isinstance(net, (AdaCDLNet_Full, AdaCDLNet_SM)):
+        D_test = utils.dictionary_noisy(net.D).detach().to(device)
+
     for sigma in noise_level:
         print(sigma)
         t = tqdm(iter(loader), desc=f"TEST-{sigma}", dynamic_ncols=True)
@@ -60,7 +64,10 @@ def test(net, loader, noise_level=25, blind=False, device=torch.device('cpu')):
                     print(f"using GT sigma.")
             else:
                 s = None
-            xhat, _ = net(y, s, mask=mask)
+            if D_test is not None:
+                xhat, _ = net(y, s, mask=mask, D=D_test)
+            else:
+                xhat, _ = net(y, s, mask=mask)
             psnr = psnr + -10*np.log10(torch.mean((x-xhat)**2).item())
         psnr = psnr / (itern+1)
         print(f"PSNR = {psnr:.3f}")
@@ -201,7 +208,10 @@ def passthrough(net, img_path, noise_std, device=torch.device('cpu'), blind=Fals
         sigma = None
 
     n = round(np.sqrt(net.M))
-    fg = net.forward_generator(y, sigma, mask=m)
+    D_test = None
+    D_test = utils.dictionary_noisy(net.D).detach().to(device)
+
+    fg = net.forward_generator(y, sigma, mask=m, D=D_test)
     yp, params, m = model.utils.pre_process(y, net.s, mask=m)
 
     for (i, xz) in enumerate(fg):

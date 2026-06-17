@@ -8,6 +8,7 @@ import torchvision
 import torchvision.transforms as transforms
 import torchvision.transforms.functional as F
 from tqdm import tqdm
+import utils
 
 class MyDataset(data.Dataset):
 	def __init__(self, root_dirs, transform, load_color=False):
@@ -73,4 +74,5 @@ def get_fit_loaders(trn_path_list =['CBSD432'],
                                           load_color, 
                                           test=True)}
 	return dataloaders
+
 

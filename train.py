@@ -6,237 +6,273 @@ import torch
 import torch.nn as nn
 
 from model import *
-from data import get_fit_loaders
+from data import get_fit_loaders, get_data_loader
 from utils import awgn, gen_bayer_mask, check_gpu
 
-def fit(net, opt, loaders,
-        sched = None,
-        epochs = 1,
-        device = torch.device("cpu"),
-        save_dir = None,
-        start_epoch = 1,
-        clip_grad = 1,
-        noise_std = 25,
-        demosaic = False,
-        verbose = True,
-        val_freq  = 1,
-        save_freq = 1,
-        epoch_fun = None,
-        mcsure = False,
-        backtrack_thresh = 1,
-        dict_perturb_mode = None):
-    """ fit net to training data.
+import argparse
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--dict_perturb", action="store_true", help="Trains Adaptive CDLNet with perturbations of its dictionary.")
+parser.add_argument("--online", action="store_true", help="Sets up Adaptive CDLNet for online learning.")
+
+class Trainer:
+    """ Universal Trainer Class:
+        Accepts model, opt, loaders, sched as prereq
+        trains model from image reconstruction loss
+        or from MCSURE
+
+        creates:
+        ------
+        - net.ckpt: last model
+        - best_val.ckpt: best validation model
+        - 0.ckpt: initial model
+        -----
+        - train.txt: history of all psnr
+        - val.txt: history of all val psnr
+        - test.txt: final test psnr 
+        - backtrack.txt: history of failed epochs
     """
-    print(f"fit: using device {device}")
+    def __init__(self, net, opt, loaders, sched=None,
+        device=torch.device("cpu"), save_dir=None, 
+        clip_grad=1, noise_std=25, demosaic=False,
+        verbose=True, val_freq=1, save_freq=1, 
+        mcsure=False, backtrack_thresh=1, epochs=6000):
+        """ init constructor
+        """
+        # init variables
+        self.net = net
+        self.opt = opt
+        self.loaders = loaders
+        self.sched = sched
+        self.device = device
+        self.save_dir = save_dir
+        self.clip_grad = clip_grad
+        self.noise_std = noise_std
+        self.demosaic = demosaic
+        self.verbose = verbose
+        self.val_freq = val_freq
+        self.save_freq = save_freq
+        self.mcsure = mcsure
+        self.backtrack_thresh = backtrack_thresh
+        self.epochs = epochs
+        if not isinstance(self.noise_std, (list, tuple)):
+            self.noise_std = (self.noise_std, self.noise_std)  
+        self.curr_epoch = 0
 
-    if not type(noise_std) in [list, tuple]:
-        noise_std = (noise_std, noise_std)
+        # vars for backtracking
+        self.top_psnr = {"train": 0, "val": 0, "test": 0}
 
-    print("Saving initialization to 0.ckpt")
+        # vars for early stopping
+        self.best_val_psnr = -float("inf")
+        self.bad_epochs = 0
+        self.patience = 500
+        self.min_delta = 0.01
 
-    ckpt_path = os.path.join(save_dir, '0.ckpt')
-    save_ckpt(ckpt_path, net, 0, opt, sched)
+    def getlr(self):
+        """ lr getter
+        """
+        return [pg['lr'] for pg in self.opt.param_groups]
+    
+    def setlr(self, lr):
+        """ lr setter
+        """
+        # if lr is not a list
+        if not isinstance(lr, (list, np.ndarray)):
+            lr = [lr for _ in range(len(self.opt.param_groups))]
+        # set the new learning rates
+        for (i, pg) in enumerate(self.opt.param_groups):
+            pg['lr'] = lr[i]
 
-    top_psnr = {"train": 0, "val": 0, "test": 0} # for backtracking
+    def run_batch(self, batch, phase):
+        """ Run phase on batch
+        """
+        # prerequisite
+        batch = batch.to(self.device)
+        mask = gen_bayer_mask(batch) if self.demosaic else 1
+        if phase in ["val", "test"]:
+            phase_nstd = (self.noise_std[0]+self.noise_std[1])/2.0
+        else:
+            phase_nstd = self.noise_std
 
-    # for early stopping
-    best_val_psnr = -float("inf")
-    patience = 500
-    min_delta = 0.01
-    bad_epochs = 0
-
-    epoch = start_epoch
-
-    while epoch < start_epoch + epochs:
-        for phase in ['train', 'val', 'test']:
-            net.train() if phase == 'train' else net.eval()
-            if epoch != epochs and phase == 'test':
-                continue
-            if phase == 'val' and epoch%val_freq != 0:
-                continue
-            if phase in ['val', 'test']:
-                phase_nstd = (noise_std[0]+noise_std[1])/2.0
-            else:
-                phase_nstd = noise_std
-            psnr = 0
-
-            t = tqdm(iter(loaders[phase]), desc=phase.upper()+'-E'+str(epoch), dynamic_ncols=True)
-            for itern, batch in enumerate(t):
-                batch = batch.to(device)
-                mask = gen_bayer_mask(batch) if demosaic else 1
-                noisy_batch, sigma_n = awgn(batch, phase_nstd)
-                obsrv_batch = mask * noisy_batch
-                opt.zero_grad()
-
-                with torch.set_grad_enabled(phase == 'train'):
-                    batch_hat, _ = net(obsrv_batch, sigma_n, mask=mask)
-
-                    # supervised or unsupervised (MCSURE) loss during training
-                    if mcsure and phase == "train":
-                        h = 1e-3
-                        b = torch.randn_like(obsrv_batch)
-                        batch_hat_b, _ = net(obsrv_batch.clone() + h*b, sigma_n, mask=mask)
-                        # assume you have a good estimator for sigma_n
-                        div = 2.0*torch.mean(((sigma_n/255.0)**2)*b*(batch_hat_b-batch_hat)) / h
-                        loss = torch.mean((obsrv_batch - batch_hat)**2) + div
-                    else:
-                        loss = torch.mean((batch - batch_hat)**2)
-
-                    if phase == 'train':
-                        loss.backward()
-                        if clip_grad is not None:
-                            nn.utils.clip_grad_norm_(net.parameters(), clip_grad)
-                        opt.step()
-                        net.project()
-                loss = loss.item()
-
-                if verbose:
-                    total_norm = grad_norm(net.parameters())
-                    t.set_postfix_str(f"loss={loss:.1e}|gnorm={total_norm:.1e}")
-                psnr = psnr - 10*np.log10(loss)
-
-            psnr = psnr/(itern+1)
-            print(f"{phase.upper()} PSNR: {psnr:.3f} dB")
-
-            if psnr > top_psnr[phase]:
-                top_psnr[phase] = psnr
-            # backtracking check
-            elif (psnr + backtrack_thresh < top_psnr[phase]) or np.isnan(loss) or np.isinf(loss):
-                break
-
-            with open(os.path.join(save_dir, f'{phase}.txt'),'a') as psnr_file:
-                psnr_file.write(f'{psnr:.3f}, ')
-
-            # Early stopping based on validation PSNR
-            if phase == "val":
-                if psnr > best_val_psnr + min_delta:
-                    best_val_psnr = psnr
-                    bad_epochs = 0
-
-                    # Save best validation checkpoint
-                    best_ckpt_path = os.path.join(save_dir, 'best_val.ckpt')
-                    print(f"New best validation PSNR: {psnr:.3f} dB")
-                    save_ckpt(best_ckpt_path, net, epoch, opt, sched)
-
-                else:
-                    bad_epochs += val_freq
-                    print(f"No validation improvement for {bad_epochs} epochs")
-
-                if bad_epochs >= patience:
-                    print("Early stopping triggered.")
-                    return
-
-        if (psnr + backtrack_thresh < top_psnr[phase]) or np.isnan(loss) or np.isinf(loss):
-            ckpt_path = os.path.join(save_dir, 'net.ckpt')
-            if epoch <= save_freq:  
-                ckpt_path = os.path.join(save_dir, '0.ckpt')
-            print(f"Loss has diverged. Backtracking to {ckpt_path} ...")
-
-            with open(os.path.join(save_dir, f'backtrack.txt'),'a') as psnr_file:
-                psnr_file.write(f'{epoch}  ')
-
-            if epoch % save_freq == 0:
-                epoch = epoch - save_freq
-            else:
-                epoch = epoch - epoch%save_freq
-
-            old_lr = np.array(getlr(opt))
-            net, _, _, _ = load_ckpt(ckpt_path, net, opt, sched)
-            new_lr = old_lr * 0.8
-            setlr(opt, new_lr)
-            print("Updated Learning Rate(s):", new_lr)
-            epoch = epoch + 1
-            continue
-
-        if sched is not None:
-            sched.step()
-            if hasattr(sched, "step_size") and epoch % sched.step_size == 0:
-                print("Updated Learning Rate(s): ")
-                print(getlr(opt))
-
-        if epoch % save_freq == 0:
-            ckpt_path = os.path.join(save_dir, 'net.ckpt')
-            print('Checkpoint: ' + ckpt_path)
-            save_ckpt(ckpt_path, net, epoch, opt, sched)
-
-            if epoch_fun is not None:
-                epoch_fun(epoch)
-
-        epoch = epoch + 1
-
-def online_fit(net, opt, stream,
-               device=torch.device("cpu"),
-               save_dir=None,
-               clip_grad=1,
-               noise_std=25,
-               demosaic=False,
-               verbose=True,
-               mcsure=False,
-               save_freq=100):
-    """ Online fit: update dictionary only over a data stream.
-    """
-    print(f"online fit: using device {device}")
-
-    if not type(noise_std) in [list, tuple]:
-        noise_std = (noise_std, noise_std)
-
-    print("Saving initialization to 0.ckpt")
-    if save_dir is not None:
-        ckpt_path = os.path.join(save_dir, "0.ckpt")
-        save_ckpt(ckpt_path, net, 0, opt, None)
-
-    net.train()
-
-    psnr_total = 0.0
-    n_batches = 0
-
-    t = tqdm(stream, desc="ONLINE", dynamic_ncols=True)
-    for itern, batch in enumerate(t, start=1):
-        batch = batch.to(device)
-        phase_nstd = noise_std
-        mask = gen_bayer_mask(batch) if demosaic else 1
+        # add noise to an extra batch
         noisy_batch, sigma_n = awgn(batch, phase_nstd)
         obsrv_batch = mask * noisy_batch
 
-        opt.zero_grad()
-        batch_hat, _ = net(obsrv_batch, sigma_n, mask=mask)
+        self.opt.zero_grad() # clear gradients
 
-        # supervised or unsupervised (MCSURE) loss during training
-        if mcsure:
-            h = 1e-3
-            b = torch.randn_like(obsrv_batch)
-            batch_hat_b, _ = net(obsrv_batch.clone() + h*b, sigma_n, mask=mask)
-            # assume you have a good estimator for sigma_n
-            div = 2.0*torch.mean(((sigma_n/255.0)**2)*b*(batch_hat_b-batch_hat)) / h
-            loss = torch.mean((obsrv_batch - batch_hat)**2) + div
-        else:
-            loss = torch.mean((batch - batch_hat)**2)
-        loss.backward()
+        with torch.set_grad_enabled(phase == "train"):
+            batch_hat, _ = self.net(obsrv_batch, sigma_n, mask=mask) # call net
 
-        if clip_grad is not None:
-            nn.utils.clip_grad_norm_(net.parameters(), clip_grad)
+            # Unsupervised (MCSURE) loss
+            if self.mcsure and phase == "train":
+                h = 1e-3 # tiny perturbation size
+                # create a new image of small perturbation
+                b = torch.randn_like(obsrv_batch)
+                batch_hat_b, _ = self.net(obsrv_batch + (h*b), sigma_n, mask=mask)
+                div = 2.0*torch.mean(((sigma_n/255.0)**2)*b*(batch_hat_b-batch_hat)) / h
+                loss = torch.mean((obsrv_batch - batch_hat)**2) + div # (+ div) offset for perturbation
+            # supervised typical reconstruction loss
+            else: loss = torch.mean((batch - batch_hat)**2)
 
-        opt.step()
-        net.project()
-        loss_value = loss.item()
-        batch_psnr = -10 * np.log10(loss_value)
-        psnr_total += batch_psnr
-        n_batches += 1
-        avg_psnr = psnr_total / n_batches
+            # train the net
+            if phase == 'train':
+                loss.backward()
+                if self.clip_grad is not None:
+                    nn.utils.clip_grad_norm_(self.net.parameters(), self.clip_grad)
+                self.opt.step()
+                if hasattr(self.net, "project"): 
+                    self.net.project()
 
-        if verbose:
-            total_norm = grad_norm(net.parameters())
-            t.set_postfix_str(f"loss={loss_value:.1e}|psnr={batch_psnr:.2f}|avg={avg_psnr:.2f}|gnorm={total_norm:.1e}")
+        return loss
+    
+    def run_phase(self, phase, epoch):
+        """ Function for each phase in fit function {train, val, test}
+        """
+        # prerequisite
+        self.net.train() if phase == "train" else self.net.eval()
+        total_psnr = 0.0
+        t = tqdm(self.loaders[phase], desc=f"{phase.upper()}-E{epoch}", dynamic_ncols=True)
 
-        if save_dir is not None and itern % save_freq == 0:
-            ckpt_path = os.path.join(save_dir, "online_net.ckpt")
-            save_ckpt(ckpt_path, net, itern, opt, None)
+        # iterate through batches
+        batch_count = 0
+        for itern, batch in enumerate(t):
+            # calculate loss and psnr
+            loss = self.run_batch(batch, phase)
+            loss_value = loss.item()
+            psnr = -10 * np.log10(loss_value)
+            total_psnr += psnr
+            batch_count += 1
 
-    print(f"ONLINE AVG PSNR: {avg_psnr:.3f} dB")
-    return avg_psnr
+            # verbose section
+            if self.verbose:
+                total_norm = grad_norm(self.net.parameters())
+                t.set_postfix_str(f"loss={loss_value:.1e}|gnorm={total_norm:.1e}")
+
+        # output avg_psnr, return it and loss_value
+        if batch_count == 0:
+            raise ValueError(f"{phase} loader is empty.")
+        avg_psnr = total_psnr / batch_count
+        print(f"{phase.upper()} PSNR: {avg_psnr:.3f} dB")
+        return avg_psnr, loss_value
+    
+    def fit(self, start_epoch=1):
+        """ Function to train net using Dataset:
+            Given a model run train, val, test phases
+            trains for max 6000 epochs
+            val phase occurs per val_freq(uency)
+        """
+        print(f"fit: using device {self.device}")
+
+        # initial checkpoint for model
+        os.makedirs(self.save_dir, exist_ok=True)
+        init_path = os.path.join(self.save_dir, "0.ckpt")
+        if not os.path.exists(init_path):
+            print("Saving initialization to 0.ckpt")
+            save_ckpt(init_path, self.net, 0, self.opt, self.sched)
+
+        # epoch phases
+        epoch = start_epoch
+        while epoch <= self.epochs:
+            self.curr_epoch = epoch
+
+            need_backtrack = False
+            for phase in ["train", "val", "test"]:
+
+                # skip test except at final epoch
+                if phase == "test" and epoch != self.epochs:
+                    continue
+                # skip val unless epoch matches val_freq
+                if phase == "val" and epoch % self.val_freq != 0:
+                    continue 
+                
+                # run each phase {train, val, test}
+                psnr, loss = self.run_phase(phase, epoch)
+                
+                # record each psnr
+                with open(os.path.join(self.save_dir, f"{phase}.txt"), "a") as f:
+                    f.write(f"{psnr:.3f}, ")
+
+                # update best psnr
+                if psnr > self.top_psnr[phase]:
+                    self.top_psnr[phase] = psnr
+                # early backtracking check, if model diverged
+                elif ((psnr + self.backtrack_thresh) < self.top_psnr[phase]
+                    or np.isnan(loss) or np.isinf(loss)):
+                    need_backtrack = True
+                    break
+                    
+                # validate the epoch
+                if phase == "val":
+                    # update best validation PSNR so far
+                    if psnr > (self.best_val_psnr + self.min_delta):
+                        self.best_val_psnr = psnr
+                        self.bad_epochs = 0
+                        best_path = os.path.join(self.save_dir, "best_val.ckpt")
+                        print(f"New best validation PSNR: {psnr:.3f} dB")
+                        save_ckpt(best_path, self.net, epoch, self.opt, self.sched)
+                    else:
+                        self.bad_epochs += self.val_freq
+                        print(f"No validation improvement for {self.bad_epochs} epochs")
+
+                    # early stopping
+                    if self.bad_epochs >= self.patience:
+                        print("Early stopping triggered.")
+                        return
+            
+            # backtracking process
+            if need_backtrack:
+                # record failed epoch in backtrack.txt
+                with open(os.path.join(self.save_dir, f'backtrack.txt'),'a') as psnr_file:
+                    psnr_file.write(f'{epoch}  ')
+
+                # find path for checkpoint 0
+                if epoch <= self.save_freq:  
+                    ckpt_path = os.path.join(self.save_dir, '0.ckpt')
+                    epoch = 0
+                else:
+                    # find path for most recent checkpoint
+                    ckpt_path = os.path.join(self.save_dir, 'net.ckpt')
+                    # find proper epoch
+                    if epoch % self.save_freq == 0:
+                        epoch = epoch - self.save_freq
+                    else:
+                        epoch = epoch - (epoch % self.save_freq)
+                print(f"Loss has diverged. Backtracking to {ckpt_path} ...")
+
+                old_lr = np.array(self.getlr())
+                # load ckpt model
+                self.net, self.opt, self.sched, _ = load_ckpt(ckpt_path, self.net, self.opt, self.sched, self.device)
+                self.net.to(self.device)
+                new_lr = old_lr * 0.8 # reduce learning rate
+                self.setlr(new_lr)
+                print("Updated Learning Rate(s):", new_lr)
+
+                epoch = epoch + 1
+                continue
+
+            # update scheduler
+            if self.sched is not None:
+                self.sched.step()
+                if hasattr(self.sched, "step_size") and epoch % self.sched.step_size == 0:
+                    print("Updated Learning Rate(s): ")
+                    print(self.getlr())
+
+            # save model's checkpoint
+            if epoch % self.save_freq == 0:
+                ckpt_path = os.path.join(self.save_dir, 'net.ckpt')
+                print('Checkpoint: ' + ckpt_path)
+                save_ckpt(ckpt_path, self.net, epoch, self.opt, self.sched)
+
+            epoch = epoch + 1 # increment epoch
+# } Class Trainer
+
+class AdaTrainer(Trainer):
+    pass
+
+# } Class AdaTrainer(Trainer)
 
 def grad_norm(params):
-    """ computes norm of mini-batch gradient
+    """ Computes norm of mini-batch gradient
     """
     total_norm = 0
     for p in params:
@@ -246,14 +282,33 @@ def grad_norm(params):
         total_norm = total_norm + param_norm.item()**2
     return total_norm**(.5)
 
-def getlr(opt):
-    return [pg['lr'] for pg in opt.param_groups]
+def save_ckpt(path, net=None,epoch=None,opt=None,sched=None):
+    """ Save Checkpoint.
+        Saves net, optimizer, scheduler state dicts and epoch num to path.
+    """
+    getSD = lambda obj: obj.state_dict() if obj is not None else None
+    torch.save({'epoch': epoch,
+                'net_state_dict': getSD(net),
+                'opt_state_dict':   getSD(opt),
+                'sched_state_dict': getSD(sched)
+                }, path)
 
-def setlr(opt, lr):
-    if not issubclass(type(lr), (list, np.ndarray)):
-        lr = [lr for _ in range(len(opt.param_groups))]
-    for (i, pg) in enumerate(opt.param_groups):
-        pg['lr'] = lr[i]
+def load_ckpt(path, net=None,opt=None,sched=None, device='cpu'):
+    """ Load Checkpoint.
+        Loads net, optimizer, scheduler and epoch number
+        from state dict stored in path.
+    """
+    ckpt = torch.load(path, map_location=device, weights_only=False)
+    def setSD(obj, name):
+        if obj is not None and name+"_state_dict" in ckpt:
+            print(f"Loading {name} state-dict...")
+            obj.load_state_dict(ckpt[name+"_state_dict"])
+        return obj
+
+    net = setSD(net, 'net')
+    opt   = setSD(opt, 'opt')
+    sched = setSD(sched, 'sched')
+    return net, opt, sched, ckpt['epoch']
 
 def init_model(args, device=torch.device("cpu")):
     """ Return model, optimizer, scheduler with optional initialization
@@ -266,26 +321,25 @@ def init_model(args, device=torch.device("cpu")):
         net = CDLNet(**model_args, init=init)
     elif model_type == "GDLNet":
         net = GDLNet(**model_args, init=init)
+    elif model_type == "AdaCDLNet_SM":
+        net = AdaCDLNet_SM(**model_args, init=init)
+    elif model_type == "AdaCDLNet_Full":
+        net = AdaCDLNet_Full(**model_args, init=init)
     elif model_type == "DnCNN":
         net = DnCNN(**model_args)
     elif model_type == "FFDNet":
         net = FFDNet(**model_args)
-    elif model_type == "AdaCDLNet_SM":
-        net = AdaCDLNet_SM(**model_args)
-    elif model_type == "AdaCDLNet_Full":
-        net = AdaCDLNet_Full(**model_args)
     else:
         raise NotImplementedError
 
     net.to(device)
-
     opt   = torch.optim.Adam(net.parameters(), **train_args['opt'])     
     sched = torch.optim.lr_scheduler.StepLR(opt, **train_args['sched'])
     ckpt_path = paths['ckpt']
 
     if ckpt_path is not None:
         print(f"Initializing net from {ckpt_path} ...")
-        net, opt, sched, epoch0 = load_ckpt(ckpt_path, net, opt, sched)
+        net, opt, sched, epoch0 = load_ckpt(ckpt_path, net, opt, sched, device)
     else:
         epoch0 = 0
 
@@ -299,34 +353,6 @@ def init_model(args, device=torch.device("cpu")):
     print(f"Using {paths['save']} ...")
     os.makedirs(paths['save'], exist_ok=True)
     return net, opt, sched, epoch0
-
-def save_ckpt(path, net=None,epoch=None,opt=None,sched=None):
-    """ Save Checkpoint.
-    Saves net, optimizer, scheduler state dicts and epoch num to path.
-    """
-    getSD = lambda obj: obj.state_dict() if obj is not None else None
-    torch.save({'epoch': epoch,
-                'net_state_dict': getSD(net),
-                'opt_state_dict':   getSD(opt),
-                'sched_state_dict': getSD(sched)
-                }, path)
-
-def load_ckpt(path, net=None,opt=None,sched=None):
-    """ Load Checkpoint.
-    Loads net, optimizer, scheduler and epoch number
-    from state dict stored in path.
-    """
-    ckpt = torch.load(path, map_location=torch.device('cpu'), weights_only=False)
-    def setSD(obj, name):
-        if obj is not None and name+"_state_dict" in ckpt:
-            print(f"Loading {name} state-dict...")
-            obj.load_state_dict(ckpt[name+"_state_dict"])
-        return obj
-
-    net = setSD(net, 'net')
-    opt   = setSD(opt, 'opt')
-    sched = setSD(sched, 'sched')
-    return net, opt, sched, ckpt['epoch']
 
 def save_args(args, ckpt=True):
     """ Write argument dictionary to file,
@@ -342,28 +368,48 @@ def save_args(args, ckpt=True):
 def main(args):
     """ Given argument dictionary, load data, initialize model, and fit model.
     """
+    # prerequisite
     device = check_gpu()
-
     model_args, train_args, paths = [args[item] for item in ['model','train','paths']]
     loaders = get_fit_loaders(**train_args['loaders'])
-    net, opt, sched, epoch0 = init_model(args, device=device)
 
-    # offline pretraining
-    fit(net, 
-        opt, 
-        loaders,
-        sched       = sched,
-        save_dir    = paths['save'],
-        start_epoch = epoch0 + 1,
-        device      = device,
-        **train_args['fit'],
-        epoch_fun = lambda epoch_num: save_args(args, epoch_num))
+    # initialize model
+    net, opt, sched, epoch0= init_model(args, device=device)
+
+    # initialize net.ckpt path in json
+    save_args(args, ckpt=True)
+
+    # initialize trainer
+    trainer = Trainer(net=net, opt=opt, loaders=loaders, sched=sched,
+                    device=device, save_dir=paths["save"], **train_args['fit'])
+    
+    try: 
+        trainer.fit(start_epoch=epoch0 + 1) # train model
+    except KeyboardInterrupt:
+        print("\nTraining interrupted by user.")
+        ckpt_path = os.path.join(paths["save"], "net.ckpt")
+        save_ckpt(ckpt_path, trainer.net, 
+                epoch=trainer.curr_epoch - 1, opt=trainer.opt, 
+                sched=trainer.sched)
+        print(f"Saved checkpoint at epoch {trainer.curr_epoch} to {ckpt_path}")
     
     # online preparation
-    for p in net.parameters():
-        p.requires_grad_(False)
-    net.D.requires_grad_(True)
-    opt = torch.optim.Adam([net.D], **train_args['opt'])
+    # for p in net.parameters():
+    #     p.requires_grad_(False)
+    # net.D.requires_grad_(True)
+    # opt = torch.optim.Adam([net.D], **train_args['opt'])
+
+    # online_fit(
+    #     net,
+    #     opt,
+    #     dataset_dir="./dataset/Set12",
+    #     batch_size=1,
+    #     device=device,
+    #     save_dir=paths["save"],
+    #     noise_std=train_args["fit"].get("noise_std", 25),
+    #     demosaic=train_args["fit"].get("demosaic", False),
+    #     load_color=train_args["loaders"].get("load_color", False)
+    # )
 
 if __name__ == "__main__":
     """ Load arguments dictionary from json file to pass to main.

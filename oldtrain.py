@@ -1,33 +1,13 @@
-#!/usr/bin/env python3
 import os, sys, json
 from tqdm import tqdm
 from pprint import pprint
 import numpy as np
 import torch
 import torch.nn as nn
-from model.net import CDLNet, GDLNet, DnCNN, FFDNet
-from data import get_fit_loaders
-from utils import awgn, gen_bayer_mask
 
-def main(args):
-    """ Given argument dictionary, load data, initialize model, and fit model.
-    """
-    ngpu = torch.cuda.device_count()
-    device = torch.device("cuda:0" if ngpu > 0 else "cpu")
-
-    model_args, train_args, paths = [args[item] for item in ['model','train','paths']]
-    loaders = get_fit_loaders(**train_args['loaders'])
-    net, opt, sched, epoch0 = init_model(args, device=device)
-
-    fit(net, 
-        opt, 
-        loaders,
-        sched       = sched,
-        save_dir    = paths['save'],
-        start_epoch = epoch0 + 1,
-        device      = device,
-        **train_args['fit'],
-        epoch_fun = lambda epoch_num: save_args(args, epoch_num))
+from model import *
+from data import get_fit_loaders, get_data_loader
+from utils import awgn, gen_bayer_mask, check_gpu
 
 def fit(net, opt, loaders,
         sched = None,
@@ -51,27 +31,41 @@ def fit(net, opt, loaders,
     if not type(noise_std) in [list, tuple]:
         noise_std = (noise_std, noise_std)
 
+    # ckpt shenanigans
     print("Saving initialization to 0.ckpt")
-
     ckpt_path = os.path.join(save_dir, '0.ckpt')
     save_ckpt(ckpt_path, net, 0, opt, sched)
 
     top_psnr = {"train": 0, "val": 0, "test": 0} # for backtracking
-    epoch = start_epoch
 
+    # for early stopping
+    best_val_psnr = -float("inf")
+    patience = 500
+    min_delta = 0.01
+    bad_epochs = 0
+
+    # run each epoch
+    epoch = start_epoch
     while epoch < start_epoch + epochs:
+        
+        # run each phase
         for phase in ['train', 'val', 'test']:
             net.train() if phase == 'train' else net.eval()
+            
+            # block skip if test or validation
             if epoch != epochs and phase == 'test':
                 continue
             if phase == 'val' and epoch%val_freq != 0:
                 continue
+
+            # edit noise if val/test
             if phase in ['val', 'test']:
                 phase_nstd = (noise_std[0]+noise_std[1])/2.0
             else:
                 phase_nstd = noise_std
             psnr = 0
 
+            # run each batch
             t = tqdm(iter(loaders[phase]), desc=phase.upper()+'-E'+str(epoch), dynamic_ncols=True)
             for itern, batch in enumerate(t):
                 batch = batch.to(device)
@@ -102,11 +96,13 @@ def fit(net, opt, loaders,
                         net.project()
                 loss = loss.item()
 
+                # if verbose: extra report
                 if verbose:
                     total_norm = grad_norm(net.parameters())
                     t.set_postfix_str(f"loss={loss:.1e}|gnorm={total_norm:.1e}")
                 psnr = psnr - 10*np.log10(loss)
-
+            # calculating and gradients done
+            
             psnr = psnr/(itern+1)
             print(f"{phase.upper()} PSNR: {psnr:.3f} dB")
 
@@ -118,6 +114,25 @@ def fit(net, opt, loaders,
 
             with open(os.path.join(save_dir, f'{phase}.txt'),'a') as psnr_file:
                 psnr_file.write(f'{psnr:.3f}, ')
+
+            # Early stopping based on validation PSNR
+            if phase == "val":
+                if psnr > best_val_psnr + min_delta:
+                    best_val_psnr = psnr
+                    bad_epochs = 0
+
+                    # Save best validation checkpoint
+                    best_ckpt_path = os.path.join(save_dir, 'best_val.ckpt')
+                    print(f"New best validation PSNR: {psnr:.3f} dB")
+                    save_ckpt(best_ckpt_path, net, epoch, opt, sched)
+
+                else:
+                    bad_epochs += val_freq
+                    print(f"No validation improvement for {bad_epochs} epochs")
+
+                if bad_epochs >= patience:
+                    print("Early stopping triggered.")
+                    return
 
         if (psnr + backtrack_thresh < top_psnr[phase]) or np.isnan(loss) or np.isinf(loss):
             ckpt_path = os.path.join(save_dir, 'net.ckpt')
@@ -157,6 +172,127 @@ def fit(net, opt, loaders,
 
         epoch = epoch + 1
 
+'''def online_fit(net, opt,
+               dataset_dir="./dataset/Set12",
+               batch_size=1,
+               device=torch.device("cpu"),
+               save_dir=None,
+               clip_grad=1,
+               noise_std=25,
+               demosaic=False,
+               load_color=False,
+               verbose=True,
+               save_freq=100,
+               eps=1e-12):
+    """
+    Online fit over Set12 using get_data_loader().
+    Logs one PSNR value after each image.
+    """
+    print(f"online fit: using device {device}")
+    print(f"online dataset: {dataset_dir}")
+
+    if not type(noise_std) in [list, tuple]:
+        noise_std = (noise_std, noise_std)
+
+    stream = get_data_loader(
+        [dataset_dir],
+        batch_size=batch_size,
+        load_color=load_color,
+        test=True
+    )
+
+    if save_dir is not None:
+        os.makedirs(save_dir, exist_ok=True)
+
+        ckpt_path = os.path.join(save_dir, "0_online.ckpt")
+        save_ckpt(ckpt_path, net, 0, opt, None)
+
+        log_path = os.path.join(save_dir, "online_psnr_per_image.csv")
+        with open(log_path, "w") as f:
+            f.write("image_index,loss,psnr,avg_psnr,grad_norm\n")
+    else:
+        log_path = None
+
+    net.train()
+
+    psnr_total = 0.0
+    n_images = 0
+
+    t = tqdm(stream, desc="ONLINE-SET12", dynamic_ncols=True)
+
+    for itern, batch in enumerate(t, start=1):
+        batch = batch.to(device)
+
+        mask = gen_bayer_mask(batch) if demosaic else 1
+        noisy_batch, sigma_n = awgn(batch, noise_std)
+        obsrv_batch = mask * noisy_batch
+
+        opt.zero_grad()
+
+        batch_hat, _ = net(obsrv_batch, sigma_n, mask=mask)
+
+        # MCSURE loss
+        h = 1e-3
+        b = torch.randn_like(obsrv_batch)
+
+        batch_hat_b, _ = net(obsrv_batch + h * b, sigma_n, mask=mask)
+
+        div = (
+            2.0
+            * torch.mean(((sigma_n / 255.0) ** 2) * b * (batch_hat_b - batch_hat))
+            / h
+        )
+
+        loss = torch.mean((obsrv_batch - batch_hat) ** 2) + div
+
+        if torch.isnan(loss) or torch.isinf(loss):
+            print(f"Skipping image {itern} due to invalid loss.")
+            continue
+
+        loss.backward()
+
+        if clip_grad is not None:
+            nn.utils.clip_grad_norm_(net.parameters(), clip_grad)
+
+        total_norm = grad_norm(net.parameters())
+
+        opt.step()
+        net.project()
+
+        loss_value = max(loss.item(), eps)
+        psnr = -10.0 * np.log10(loss_value)
+
+        psnr_total += psnr
+        n_images += 1
+        avg_psnr = psnr_total / n_images
+
+        if save_dir is not None:
+            with open(log_path, "a") as f:
+                f.write(
+                    f"{itern},{loss_value:.8e},"
+                    f"{psnr:.6f},{avg_psnr:.6f},{total_norm:.6e}\n"
+                )
+
+        if verbose:
+            t.set_postfix_str(
+                f"img={itern}|psnr={psnr:.2f}|avg={avg_psnr:.2f}|gnorm={total_norm:.1e}"
+            )
+
+        if save_dir is not None and itern % save_freq == 0:
+            ckpt_path = os.path.join(save_dir, "online_net.ckpt")
+            save_ckpt(ckpt_path, net, itern, opt, None)
+
+    if n_images == 0:
+        print("No valid online updates were completed.")
+        return None
+
+    print(f"ONLINE AVG PSNR: {avg_psnr:.3f} dB")
+
+    if log_path is not None:
+        print(f"Saved per-image PSNR to: {log_path}")
+
+    return avg_psnr'''
+
 def grad_norm(params):
     """ computes norm of mini-batch gradient
     """
@@ -184,7 +320,7 @@ def init_model(args, device=torch.device("cpu")):
     model_type, model_args, train_args, paths = [args[item] for item in ['type','model','train','paths']]
     init = False if paths['ckpt'] is not None else True
 
-    if model_type in "CDLNet":
+    if model_type == "CDLNet":
         net = CDLNet(**model_args, init=init)
     elif model_type == "GDLNet":
         net = GDLNet(**model_args, init=init)
@@ -192,6 +328,10 @@ def init_model(args, device=torch.device("cpu")):
         net = DnCNN(**model_args)
     elif model_type == "FFDNet":
         net = FFDNet(**model_args)
+    elif model_type == "AdaCDLNet_SM":
+        net = AdaCDLNet_SM(**model_args)
+    elif model_type == "AdaCDLNet_Full":
+        net = AdaCDLNet_Full(**model_args)
     else:
         raise NotImplementedError
 
@@ -234,7 +374,7 @@ def load_ckpt(path, net=None,opt=None,sched=None):
     Loads net, optimizer, scheduler and epoch number
     from state dict stored in path.
     """
-    ckpt = torch.load(path, map_location=torch.device('cpu'))
+    ckpt = torch.load(path, map_location=torch.device('cpu'), weights_only=False)
     def setSD(obj, name):
         if obj is not None and name+"_state_dict" in ckpt:
             print(f"Loading {name} state-dict...")
@@ -256,6 +396,44 @@ def save_args(args, ckpt=True):
         args['paths']['ckpt'] = ckpt_path
     with open(os.path.join(save_path, "args.json"), "+w") as outfile:
         outfile.write(json.dumps(args, indent=4, sort_keys=True))
+
+def main(args):
+    """ Given argument dictionary, load data, initialize model, and fit model.
+    """
+    device = check_gpu()
+
+    model_args, train_args, paths = [args[item] for item in ['model','train','paths']]
+    loaders = get_fit_loaders(**train_args['loaders'])
+    net, opt, sched, epoch0 = init_model(args, device=device)
+
+    '''# offline pretraining
+    fit(net, 
+        opt, 
+        loaders,
+        sched       = sched,
+        save_dir    = paths['save'],
+        start_epoch = epoch0 + 1,
+        device      = device,
+        **train_args['fit'],
+        epoch_fun = lambda epoch_num: save_args(args, epoch_num))
+    
+    # online preparation
+    for p in net.parameters():
+        p.requires_grad_(False)
+    net.D.requires_grad_(True)
+    opt = torch.optim.Adam([net.D], **train_args['opt'])
+
+    # online_fit(
+    #     net,
+    #     opt,
+    #     dataset_dir="./dataset/Set12",
+    #     batch_size=1,
+    #     device=device,
+    #     save_dir=paths["save"],
+    #     noise_std=train_args["fit"].get("noise_std", 25),
+    #     demosaic=train_args["fit"].get("demosaic", False),
+    #     load_color=train_args["loaders"].get("load_color", False)
+    # )'''
 
 if __name__ == "__main__":
     """ Load arguments dictionary from json file to pass to main.
