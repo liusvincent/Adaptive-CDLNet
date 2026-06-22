@@ -6,31 +6,30 @@ import torch
 import torch.nn as nn
 
 from model import *
-from data import get_fit_loaders, get_data_loader
-from utils import awgn, gen_bayer_mask, check_gpu
+from data import get_fit_loaders
+from utils import awgn, gen_bayer_mask, check_gpu, dictionary_permute, dictionary_noisy, random_dictionary
 
 import argparse
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--dict_perturb", action="store_true", help="Trains Adaptive CDLNet with perturbations of its dictionary.")
-parser.add_argument("--online", action="store_true", help="Sets up Adaptive CDLNet for online learning.")
+parser.add_argument("--online", action="store_true", help="flag for online setup")
 
 class Trainer:
     """ Universal Trainer Class:
-        Accepts model, opt, loaders, sched as prereq
-        trains model from image reconstruction loss
-        or from MCSURE
+    Accepts model, opt, loaders, sched as prereq
+    trains model from image reconstruction loss
+    or from MCSURE
 
-        creates:
-        ------
-        - net.ckpt: last model
-        - best_val.ckpt: best validation model
-        - 0.ckpt: initial model
-        -----
-        - train.txt: history of all psnr
-        - val.txt: history of all val psnr
-        - test.txt: final test psnr 
-        - backtrack.txt: history of failed epochs
+    creates:
+    ------
+    + net.ckpt: last model
+    + best_val.ckpt: best validation model
+    + 0.ckpt: initial model
+    -----
+    + train.txt: history of all psnr
+    + val.txt: history of all val psnr
+    + test.txt: final test psnr 
+    + backtrack.txt: history of failed epochs
     """
     def __init__(self, net, opt, loaders, sched=None,
         device=torch.device("cpu"), save_dir=None, 
@@ -55,6 +54,7 @@ class Trainer:
         self.mcsure = mcsure
         self.backtrack_thresh = backtrack_thresh
         self.epochs = epochs
+
         if not isinstance(self.noise_std, (list, tuple)):
             self.noise_std = (self.noise_std, self.noise_std)  
         self.curr_epoch = 0
@@ -83,7 +83,7 @@ class Trainer:
         for (i, pg) in enumerate(self.opt.param_groups):
             pg['lr'] = lr[i]
 
-    def run_batch(self, batch, phase):
+    def run_batch(self, batch, phase, D_used=None):
         """ Run phase on batch
         """
         # prerequisite
@@ -101,14 +101,22 @@ class Trainer:
         self.opt.zero_grad() # clear gradients
 
         with torch.set_grad_enabled(phase == "train"):
-            batch_hat, _ = self.net(obsrv_batch, sigma_n, mask=mask) # call net
-
+            # batch_hat, _ = self.net(obsrv_batch, sigma_n, mask=mask, D_used=D_used) # call net
+            if D_used is None:
+                batch_hat, _ = self.net(obsrv_batch, sigma_n, mask=mask)
+            else:
+                batch_hat, _ = self.net(obsrv_batch, sigma_n, mask=mask, D=D_used)
             # Unsupervised (MCSURE) loss
             if self.mcsure and phase == "train":
                 h = 1e-3 # tiny perturbation size
                 # create a new image of small perturbation
                 b = torch.randn_like(obsrv_batch)
-                batch_hat_b, _ = self.net(obsrv_batch + (h*b), sigma_n, mask=mask)
+                # batch_hat_b, _ = self.net(obsrv_batch + (h*b), sigma_n, mask=mask, D_used=D_used)
+                if D_used is None:
+                    batch_hat_b, _ = self.net(obsrv_batch + h*b, sigma_n, mask=mask)
+                else:
+                    batch_hat_b, _ = self.net(obsrv_batch + h*b, sigma_n, mask=mask, D=D_used)
+
                 div = 2.0*torch.mean(((sigma_n/255.0)**2)*b*(batch_hat_b-batch_hat)) / h
                 loss = torch.mean((obsrv_batch - batch_hat)**2) + div # (+ div) offset for perturbation
             # supervised typical reconstruction loss
@@ -125,6 +133,14 @@ class Trainer:
 
         return loss
     
+    def progress_bar(self, t, loss_value):
+        """ Add info to the progress bar:
+        + verbose option
+        """
+        if self.verbose:
+            total_norm = grad_norm(self.net.parameters())
+            t.set_postfix_str(f"loss={loss_value:.1e}|gnorm={total_norm:.1e}")
+
     def run_phase(self, phase, epoch):
         """ Function for each phase in fit function {train, val, test}
         """
@@ -143,10 +159,7 @@ class Trainer:
             total_psnr += psnr
             batch_count += 1
 
-            # verbose section
-            if self.verbose:
-                total_norm = grad_norm(self.net.parameters())
-                t.set_postfix_str(f"loss={loss_value:.1e}|gnorm={total_norm:.1e}")
+            self.progress_bar(t, loss_value)
 
         # output avg_psnr, return it and loss_value
         if batch_count == 0:
@@ -157,9 +170,9 @@ class Trainer:
     
     def fit(self, start_epoch=1):
         """ Function to train net using Dataset:
-            Given a model run train, val, test phases
-            trains for max 6000 epochs
-            val phase occurs per val_freq(uency)
+        Given a model run train, val, test phases
+        trains for max 6000 epochs
+        val phase occurs per val_freq(uency)
         """
         print(f"fit: using device {self.device}")
 
@@ -264,12 +277,72 @@ class Trainer:
                 save_ckpt(ckpt_path, self.net, epoch, self.opt, self.sched)
 
             epoch = epoch + 1 # increment epoch
-# } Class Trainer
+# end Trainer
 
 class AdaTrainer(Trainer):
-    pass
+    """ Adaptive Trainer Class for AdaCDLNet:
+    inherits Trainer class
+    includes training with perturbed dictionaries
+    (more intensive training of Ada-LISTA)
+    """
+    def __init__(self, clean_prob=0.5, noise_prob=0.3,
+                permute_prob=0.15, random_prob=0.05, 
+                warmup_frac=0.05, seed=None, **kwargs):
+        """ init constructor
+        """
+        super().__init__(**kwargs)
+        self.clean_prob = clean_prob
+        self.noise_prob = noise_prob
+        self.permute_prob = permute_prob
+        self.random_prob = random_prob
+        self.warmup_epochs = int(self.epochs * warmup_frac)
+        self.last_perturb = "clean"
+        self.rng = np.random.default_rng(seed)
+        
+        prob_sum = clean_prob + noise_prob + permute_prob + random_prob
+        if not np.isclose(prob_sum, 1.0):
+            raise ValueError(f"Perturbation probabilities must sum to 1. Got {prob_sum}")
+        
 
-# } Class AdaTrainer(Trainer)
+    def perturb(self):
+        """ perturb dictionary based on prob chances
+        and no. warmup epochs
+        detach() the dictionary if perturb
+        """
+        r = self.rng.random()
+        # if epochs less than warmup epochs use normal dictionary
+        if (self.curr_epoch <= self.warmup_epochs or r < self.clean_prob):
+            self.last_perturb = "clean"
+            return self.net.D
+        elif r < self.noise_prob + self.clean_prob:
+            self.last_perturb = "noisy"
+            return dictionary_noisy(self.net.D.detach()).detach()
+        elif r < self.permute_prob + self.noise_prob + self.clean_prob:
+            self.last_perturb = "permute"
+            return dictionary_permute(self.net.D.detach()).detach()
+        else:
+            self.last_perturb = "random"
+            return random_dictionary(self.net.D.detach()).detach()
+
+    def run_batch(self, batch, phase):
+        """ Override run_batch to carry out dict perturbation
+        """
+        if phase == "train":
+            D_used = self.perturb()
+        else:
+            self.last_perturb = "clean"
+            D_used = self.net.D
+        return super().run_batch(batch, phase, D_used=D_used)
+    
+    def progress_bar(self, t, loss_value):
+        """ Add info to the progress bar
+        + verbose option
+        + dict perturbation info
+        """
+        if self.verbose:
+            total_norm = grad_norm(self.net.parameters())
+            t.set_postfix_str(f"loss={loss_value:.1e}|gnorm={total_norm:.1e}|dict={self.last_perturb}")
+# end AdaTrainer(Trainer)
 
 def grad_norm(params):
     """ Computes norm of mini-batch gradient
@@ -283,8 +356,8 @@ def grad_norm(params):
     return total_norm**(.5)
 
 def save_ckpt(path, net=None,epoch=None,opt=None,sched=None):
-    """ Save Checkpoint.
-        Saves net, optimizer, scheduler state dicts and epoch num to path.
+    """ Save Checkpoint
+    Saves net, optimizer, scheduler state dicts and epoch num to path.
     """
     getSD = lambda obj: obj.state_dict() if obj is not None else None
     torch.save({'epoch': epoch,
@@ -294,9 +367,9 @@ def save_ckpt(path, net=None,epoch=None,opt=None,sched=None):
                 }, path)
 
 def load_ckpt(path, net=None,opt=None,sched=None, device='cpu'):
-    """ Load Checkpoint.
-        Loads net, optimizer, scheduler and epoch number
-        from state dict stored in path.
+    """ Load Checkpoint
+    Loads net, optimizer, scheduler and epoch number
+    from state dict stored in path.
     """
     ckpt = torch.load(path, map_location=device, weights_only=False)
     def setSD(obj, name):
@@ -310,11 +383,10 @@ def load_ckpt(path, net=None,opt=None,sched=None, device='cpu'):
     sched = setSD(sched, 'sched')
     return net, opt, sched, ckpt['epoch']
 
-def init_model(args, device=torch.device("cpu")):
-    """ Return model, optimizer, scheduler with optional initialization
-    from checkpoint.
+def init_model(model_type, model_args, train_args, paths, device=torch.device("cpu")):
+    """ Return model, optimizer, scheduler with optional 
+    initialization from checkpoint.
     """
-    model_type, model_args, train_args, paths = [args[item] for item in ['type','model','train','paths']]
     init = False if paths['ckpt'] is not None else True
 
     if model_type == "CDLNet":
@@ -366,38 +438,47 @@ def save_args(args, ckpt=True):
         outfile.write(json.dumps(args, indent=4, sort_keys=True))
 
 def main(args):
-    """ Given argument dictionary, load data, initialize model, and fit model.
+    """ Given argument dictionary 
+    load data, initialize model, and fit model.
     """
     # prerequisite
     device = check_gpu()
-    model_args, train_args, paths = [args[item] for item in ['model','train','paths']]
+    model_type, model_args, train_args, paths = [args[item] for item in ['type', 'model', 'train', 'paths']]
     loaders = get_fit_loaders(**train_args['loaders'])
 
     # initialize model
-    net, opt, sched, epoch0= init_model(args, device=device)
+    net, opt, sched, epoch0= init_model(model_type, model_args, train_args, paths, device=device)
 
     # initialize net.ckpt path in json
     save_args(args, ckpt=True)
 
     # initialize trainer
-    trainer = Trainer(net=net, opt=opt, loaders=loaders, sched=sched,
+    if model_type == "AdaCDLNet_SM" or model_type == "AdaCDLNet_Full":
+        trainer = AdaTrainer(net=net, opt=opt, loaders=loaders, sched=sched,
+                    device=device, save_dir=paths["save"], **train_args['fit'], 
+                    **train_args['dict'])
+    else:
+        trainer = Trainer(net=net, opt=opt, loaders=loaders, sched=sched,
                     device=device, save_dir=paths["save"], **train_args['fit'])
-    
+
     try: 
         trainer.fit(start_epoch=epoch0 + 1) # train model
     except KeyboardInterrupt:
         print("\nTraining interrupted by user.")
         ckpt_path = os.path.join(paths["save"], "net.ckpt")
-        save_ckpt(ckpt_path, trainer.net, 
-                epoch=trainer.curr_epoch - 1, opt=trainer.opt, 
-                sched=trainer.sched)
+        save_ckpt(ckpt_path, trainer.net, epoch=trainer.curr_epoch - 1, 
+                  opt=trainer.opt, sched=trainer.sched)
         print(f"Saved checkpoint at epoch {trainer.curr_epoch} to {ckpt_path}")
     
     # online preparation
-    # for p in net.parameters():
-    #     p.requires_grad_(False)
-    # net.D.requires_grad_(True)
-    # opt = torch.optim.Adam([net.D], **train_args['opt'])
+    # if trainer.isinstance(AdaTrainer) and ARGS.online:
+    #     for p in net.parameters():
+    #         p.requires_grad_(False) # disables learning for solver
+    #     net.D.requires_grad_(True) # enables learning for dictionary
+    #     opt = torch.optim.Adam([net.D], **train_args['opt'])
+    #     ckpt_path = os.path.join(paths["save"], "net.ckpt")
+    #     save_ckpt(ckpt_path, trainer.net, epoch=trainer.curr_epoch, 
+    #               opt=opt, sched=trainer.sched)
 
     # online_fit(
     #     net,
