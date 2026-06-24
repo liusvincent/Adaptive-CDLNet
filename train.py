@@ -12,7 +12,9 @@ from utils import awgn, gen_bayer_mask, check_gpu, dictionary_permute, dictionar
 import argparse
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--online", action="store_true", help="flag for online setup")
+parser.add_argument("--online", action="store_true", help="flag for setup AdaCDLNet for online adaptation")
+parser.add_argument("--config", type=str, help="path to one json config")
+parser.add_argument("--configs", nargs="+", help="paths to multiple json configs")
 
 class Trainer:
     """ Universal Trainer Class:
@@ -85,6 +87,8 @@ class Trainer:
 
     def run_batch(self, batch, phase, D_used=None):
         """ Run phase on batch
+        calculate and return loss
+        backpropogation
         """
         # prerequisite
         batch = batch.to(self.device)
@@ -143,6 +147,7 @@ class Trainer:
 
     def run_phase(self, phase, epoch):
         """ Function for each phase in fit function {train, val, test}
+        loops through the batches in the epoch
         """
         # prerequisite
         self.net.train() if phase == "train" else self.net.eval()
@@ -158,7 +163,6 @@ class Trainer:
             psnr = -10 * np.log10(loss_value)
             total_psnr += psnr
             batch_count += 1
-
             self.progress_bar(t, loss_value)
 
         # output avg_psnr, return it and loss_value
@@ -285,9 +289,9 @@ class AdaTrainer(Trainer):
     includes training with perturbed dictionaries
     (more intensive training of Ada-LISTA)
     """
-    def __init__(self, clean_prob=0.5, noise_prob=0.3,
-                permute_prob=0.15, random_prob=0.05, 
-                warmup_frac=0.05, seed=None, **kwargs):
+    def __init__(self, clean_prob=1.0, noise_prob=0.0,
+                permute_prob=0.0, random_prob=0.0, 
+                warmup_frac=0.05, seed=None, noise_sigma=0.01, **kwargs):
         """ init constructor
         """
         super().__init__(**kwargs)
@@ -298,6 +302,7 @@ class AdaTrainer(Trainer):
         self.warmup_epochs = int(self.epochs * warmup_frac)
         self.last_perturb = "clean"
         self.rng = np.random.default_rng(seed)
+        self.noise_sigma = noise_sigma
         
         prob_sum = clean_prob + noise_prob + permute_prob + random_prob
         if not np.isclose(prob_sum, 1.0):
@@ -316,7 +321,7 @@ class AdaTrainer(Trainer):
             return self.net.D
         elif r < self.noise_prob + self.clean_prob:
             self.last_perturb = "noisy"
-            return dictionary_noisy(self.net.D.detach()).detach()
+            return dictionary_noisy(self.net.D.detach(), sigma=self.noise_sigma).detach()
         elif r < self.permute_prob + self.noise_prob + self.clean_prob:
             self.last_perturb = "permute"
             return dictionary_permute(self.net.D.detach()).detach()
@@ -456,7 +461,7 @@ def main(args):
     if model_type == "AdaCDLNet_SM" or model_type == "AdaCDLNet_Full":
         trainer = AdaTrainer(net=net, opt=opt, loaders=loaders, sched=sched,
                     device=device, save_dir=paths["save"], **train_args['fit'], 
-                    **train_args['dict'])
+                    **train_args.get("dict",{}))
     else:
         trainer = Trainer(net=net, opt=opt, loaders=loaders, sched=sched,
                     device=device, save_dir=paths["save"], **train_args['fit'])
@@ -493,13 +498,23 @@ def main(args):
     # )
 
 if __name__ == "__main__":
-    """ Load arguments dictionary from json file to pass to main.
+    """ Load arguments json file to pass to main.
     """
-    if len(sys.argv)<2:
-        print('ERROR: usage: train.py [path/to/arg_file.json]')
+    ARGS = parser.parse_args()
+
+    if ARGS.config:
+        with open(ARGS.config) as f:
+            args = json.load(f)
+        pprint(args)
+        main(args)
+
+    elif ARGS.configs:
+        for cfg in ARGS.configs:
+            with open(cfg) as f:
+                args = json.load(f)
+            pprint(args)
+            main(args)
+
+    else:
+        print("ERROR: use --config path/to/config.json or --configs a.json b.json")
         sys.exit(1)
-    args_file = open(sys.argv[1])
-    args = json.load(args_file)
-    pprint(args)
-    args_file.close()
-    main(args)

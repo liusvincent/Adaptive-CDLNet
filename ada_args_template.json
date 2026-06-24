@@ -45,7 +45,8 @@
 		"permute_prob": 0.15,
         "random_prob":0.05,
 		"seed": null,
-		"warmup_frac": 0.05
+		"warmup_frac": 0.05,
+		"noise_sigma": 0.01
 	}
 }
 }
